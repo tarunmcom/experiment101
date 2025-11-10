@@ -12,8 +12,25 @@ import torchvision.transforms as transforms
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+import requests
+import json
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# ==================== Slack Notifications ====================
+def send_slack(msg, webhook_url=None):
+    """Send a message to Slack webhook"""
+    if webhook_url is None:
+        return  # Skip if no webhook configured
+    
+    try:
+        data = {"text": msg}
+        response = requests.post(webhook_url, json.dumps(data), timeout=5)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"⚠️  Failed to send Slack notification: {e}")
+        return False
 
 
 # ==================== Dataset Class ====================
@@ -480,6 +497,11 @@ def main():
         'early_stopping_patience': 15,
         'min_delta': 1e-4,
         'compile_model': False,  # Set to True for ~20-50% speedup (requires PyTorch 2.0+)
+        
+        # Slack notifications
+        'slack_webhook': 'https://hooks.slack.com/services/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',
+        'slack_enabled': True,  # Set to False to disable notifications
+        'slack_update_frequency': 5,  # Send update every N epochs
     }
     
     print("="*60)
@@ -570,6 +592,19 @@ def main():
     print("Starting training...")
     print("="*60)
     
+    # Send training start notification
+    if config.get('slack_enabled', False):
+        slack_webhook = config.get('slack_webhook')
+        msg = f"🚀 *U-Net Training Started*\n" \
+              f"• Device: {config['device']}\n" \
+              f"• Training samples: {len(train_dataset)}\n" \
+              f"• Validation samples: {len(val_dataset)}\n" \
+              f"• Batch size: {config['batch_size']}\n" \
+              f"• Max epochs: {config['num_epochs']}\n" \
+              f"• Learning rate: {config['learning_rate']}\n" \
+              f"• Model parameters: {num_params:,}"
+        send_slack(msg, slack_webhook)
+    
     for epoch in range(1, config['num_epochs'] + 1):
         print(f"\nEpoch {epoch}/{config['num_epochs']}")
         print("-"*60)
@@ -599,6 +634,16 @@ def main():
         print(f"  Train Dice: {train_metrics['dice']:.4f} | Val Dice: {val_metrics['dice']:.4f}")
         print(f"  Learning Rate: {current_lr:.2e}")
         
+        # Send periodic Slack updates
+        if config.get('slack_enabled', False) and epoch % config.get('slack_update_frequency', 5) == 0:
+            slack_webhook = config.get('slack_webhook')
+            msg = f"📊 *Epoch {epoch}/{config['num_epochs']} Update*\n" \
+                  f"• Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}\n" \
+                  f"• Train IoU: {train_metrics['iou']:.4f} | Val IoU: {val_metrics['iou']:.4f}\n" \
+                  f"• Train Dice: {train_metrics['dice']:.4f} | Val Dice: {val_metrics['dice']:.4f}\n" \
+                  f"• Learning Rate: {current_lr:.2e}"
+            send_slack(msg, slack_webhook)
+        
         # Update learning rate scheduler
         scheduler.step(val_metrics['loss'])
         
@@ -617,6 +662,16 @@ def main():
                 'val_loss': val_metrics['loss'],
             }, os.path.join(config['save_dir'], 'best_model_iou.pth'))
             print(f"  ✓ Saved best model (IoU: {best_val_iou:.4f})")
+            
+            # Send Slack notification for new best model
+            if config.get('slack_enabled', False):
+                slack_webhook = config.get('slack_webhook')
+                msg = f"🎯 *New Best Model! (IoU)*\n" \
+                      f"• Epoch: {epoch}/{config['num_epochs']}\n" \
+                      f"• Val IoU: {best_val_iou:.4f}\n" \
+                      f"• Val Loss: {val_metrics['loss']:.4f}\n" \
+                      f"• Val Dice: {val_metrics['dice']:.4f}"
+                send_slack(msg, slack_webhook)
         
         # Early stopping check
         if val_metrics['loss'] < (best_val_loss - config['min_delta']):
@@ -640,6 +695,17 @@ def main():
             print("\n" + "="*60)
             print("Early stopping triggered!")
             print("="*60)
+            
+            # Send early stopping notification
+            if config.get('slack_enabled', False):
+                slack_webhook = config.get('slack_webhook')
+                msg = f"⛔ *Early Stopping Triggered*\n" \
+                      f"• Stopped at epoch: {epoch}/{config['num_epochs']}\n" \
+                      f"• Best Val IoU: {best_val_iou:.4f}\n" \
+                      f"• Best Val Loss: {best_val_loss:.4f}\n" \
+                      f"• No improvement for {config['early_stopping_patience']} epochs"
+                send_slack(msg, slack_webhook)
+            
             break
         
         # Save checkpoint every 10 epochs
@@ -665,6 +731,19 @@ def main():
     print(f"Best Validation IoU: {best_val_iou:.4f}")
     print(f"Best Validation Loss: {best_val_loss:.4f}")
     print("="*60)
+    
+    # Send training completion notification
+    if config.get('slack_enabled', False):
+        slack_webhook = config.get('slack_webhook')
+        msg = f"✅ *Training Completed!*\n" \
+              f"• Total epochs: {epoch}\n" \
+              f"• Best Val IoU: {best_val_iou:.4f}\n" \
+              f"• Best Val Loss: {best_val_loss:.4f}\n" \
+              f"• Final Train IoU: {history['train_iou'][-1]:.4f}\n" \
+              f"• Final Val IoU: {history['val_iou'][-1]:.4f}\n" \
+              f"• Model saved in: {config['save_dir']}/\n" \
+              f"🎉 Ready for inference!"
+        send_slack(msg, slack_webhook)
     
     # Plot training history
     plot_training_history(history)
