@@ -269,7 +269,7 @@ def calculate_dice(predictions, targets, threshold=0.5):
 
 
 # ==================== Training and Validation ====================
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, scaler=None, amp_dtype=torch.float32):
     """Train for one epoch"""
     model.train()
     running_loss = 0.0
@@ -279,21 +279,29 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     running_iou = 0.0
     running_dice_metric = 0.0
     
+    use_amp = scaler is not None and amp_dtype != torch.float32
+    
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
     for images, masks in pbar:
         images = images.to(device)
         masks = masks.to(device)
         
-        # Forward pass
         optimizer.zero_grad()
-        outputs = model(images)
         
-        # Calculate loss
-        total_loss, bce_loss, dice_loss, focal_loss = criterion(outputs, masks)
+        # Forward pass with automatic mixed precision
+        with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            outputs = model(images)
+            # Calculate loss
+            total_loss, bce_loss, dice_loss, focal_loss = criterion(outputs, masks)
         
-        # Backward pass
-        total_loss.backward()
-        optimizer.step()
+        # Backward pass with gradient scaling
+        if use_amp and scaler is not None:
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            optimizer.step()
         
         # Calculate metrics
         iou = calculate_iou(outputs, masks)
@@ -325,7 +333,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     }
 
 
-def validate_epoch(model, dataloader, criterion, device, epoch):
+def validate_epoch(model, dataloader, criterion, device, epoch, amp_dtype=torch.float32):
     """Validate for one epoch"""
     model.eval()
     running_loss = 0.0
@@ -335,17 +343,19 @@ def validate_epoch(model, dataloader, criterion, device, epoch):
     running_iou = 0.0
     running_dice_metric = 0.0
     
+    use_amp = amp_dtype != torch.float32
+    
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
     with torch.no_grad():
         for images, masks in pbar:
             images = images.to(device)
             masks = masks.to(device)
             
-            # Forward pass
-            outputs = model(images)
-            
-            # Calculate loss
-            total_loss, bce_loss, dice_loss, focal_loss = criterion(outputs, masks)
+            # Forward pass with automatic mixed precision
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                outputs = model(images)
+                # Calculate loss
+                total_loss, bce_loss, dice_loss, focal_loss = criterion(outputs, masks)
             
             # Calculate metrics
             iou = calculate_iou(outputs, masks)
@@ -487,7 +497,7 @@ def main():
     config = {
         'train_path': 'DocTamperV1-TrainingSet',
         'val_path': 'DocTamperV1-TestingSet',
-        'batch_size': 8,
+        'batch_size': 16,
         'num_epochs': 100,
         'learning_rate': 1e-3,
         'weight_decay': 1e-5,
@@ -497,6 +507,10 @@ def main():
         'early_stopping_patience': 15,
         'min_delta': 1e-4,
         'compile_model': False,  # Set to True for ~20-50% speedup (requires PyTorch 2.0+)
+        
+        # Mixed Precision Training
+        'use_amp': True,  # Set to True for mixed precision training
+        'amp_dtype': 'bfloat16',  # 'bfloat16' or 'float16' (bfloat16 more stable, requires Ampere+ GPU)
         
         # Slack notifications
         'slack_webhook': 'https://hooks.slack.com/services/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',
@@ -575,6 +589,29 @@ def main():
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, 
                                  verbose=True, min_lr=1e-7)
     
+    # Mixed Precision Training setup
+    use_amp = config.get('use_amp', False)
+    scaler = None
+    amp_dtype = torch.float32  # Default
+    
+    if use_amp and config['device'] == 'cuda':
+        # Determine dtype
+        dtype_str = config.get('amp_dtype', 'bfloat16')
+        if dtype_str == 'bfloat16':
+            amp_dtype = torch.bfloat16
+            print("Mixed Precision Training: bfloat16")
+        else:
+            amp_dtype = torch.float16
+            print("Mixed Precision Training: float16")
+            
+        # GradScaler for float16 (not needed for bfloat16 but doesn't hurt)
+        scaler = torch.cuda.amp.GradScaler(enabled=(dtype_str == 'float16'))
+        print(f"✓ AMP enabled with {dtype_str}")
+    else:
+        print("Mixed Precision Training: Disabled (using float32)")
+    
+    print("="*60)
+    
     # Training history
     history = {
         'train_loss': [], 'val_loss': [],
@@ -610,10 +647,10 @@ def main():
         print("-"*60)
         
         # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler, amp_dtype)
         
         # Validate
-        val_metrics = validate_epoch(model, val_loader, criterion, device, epoch)
+        val_metrics = validate_epoch(model, val_loader, criterion, device, epoch, amp_dtype)
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
